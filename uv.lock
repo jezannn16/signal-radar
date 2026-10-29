@@ -863,6 +863,7 @@ name = "signal-radar"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "certifi" },
     { name = "python-dotenv" },
 ]
 
@@ -878,6 +879,7 @@ telegram = [
 [package.metadata]
 requires-dist = [
     { name = "aiogram", marker = "extra == 'telegram'", specifier = ">=3.13,<4" },
+    { name = "certifi", specifier = ">=2024.8.30" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "python-dotenv", specifier = ">=1,<2" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },

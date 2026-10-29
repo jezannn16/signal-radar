@@ -1,38 +1,58 @@
 # Signal Radar
 
-Локальный монитор публичных RSS/Atom публикаций и GitHub Releases с нормализацией ссылок, объяснимым приоритетом и журналом доставки.
+Локальный монитор RSS/Atom лент и публичных GitHub Releases. Он нормализует и дедуплицирует публикации, применяет объяснимые keyword-правила и хранит состояние в SQLite.
 
-## Реализовано
+[![CI](https://github.com/jezannn16/signal-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/jezannn16/signal-radar/actions/workflows/ci.yml)
 
-- RSS/Atom reader на XML stdlib; официальный GitHub REST API `repos/{owner}/{repo}/releases`, необязательный token и pagination через Link header.
-- Изолированный сбор источников: сбой одного источника записывается в source status и не мешает остальным.
-- Checkpoint/last fetched timestamp, ETag/Last-Modified checkpoint, fetched/published UTC timestamps, canonical URL и SHA-256 content hash.
-- Повторный элемент обновляется, а предыдущая версия сохраняется в `item_versions`; одинаковые URL с tracking params дедуплицируются.
-- Include/exclude keyword rules, rule score и причина включения; `/why` CLI команда показывает объяснение и первичный URL.
-- CLI preview/dry run, ручная Telegram доставка `digest --send`, daily/weekly scheduler в `run`, timezone, quiet hours, global minimum interval и delivery log. Внешняя доставка at-most-once; только явный HTTP 429 повторяется до двух раз с Retry-After.
+**Навигация:** [Как работает](#как-работает) · [Установка и первый запуск](#установка-и-первый-запуск) · [Telegram дайджест](#telegram-дайджест) · [Проверки](#проверки) · [Безопасность и ограничения](#безопасность-и-ограничения)
 
-## Запуск
+## Как работает
 
-Нужен Python 3.11+.
+```mermaid
+flowchart LR
+    R[RSS или Atom] --> C[Сбор публикаций]
+    G[GitHub Releases API] --> C
+    C --> N[Нормализация и дедупликация]
+    N --> F[Include / exclude правила]
+    F --> D[(Локальная SQLite база)]
+    D --> P[CLI preview]
+    D -->|только явная отправка| T[Telegram Bot API]
+```
+
+- Источники добавляются отдельно; ошибка одной ленты не мешает обработке остальных.
+- GitHub читается через публичный REST endpoint Releases, с поддержкой Link pagination. Токен необязателен и нужен только при необходимости дополнительного лимита API.
+- URL нормализуются с удалением типичных tracking-параметров. Изменения публикации сохраняются в `item_versions`.
+- Include/exclude правила дают объяснение выбранному элементу через `why ID`.
+- Перед отправкой Telegram можно посмотреть очередь командой `digest`; для отправки необходим явный `digest --send`.
+
+## Установка и первый запуск
+
+Нужны Python 3.11+ и [uv](https://docs.astral.sh/uv/).
 
 ```sh
-uv venv --python 3.12
-uv pip install -e '.[dev]'
-uv run signal-radar add-source rss Python https://www.python.org/blogs/rss/
-uv run signal-radar add-source github Python-Releases python/cpython
+uv sync --extra dev
+uv run signal-radar --help
+uv run signal-radar add-source rss Hacker-News https://hnrss.org/frontpage
+uv run signal-radar add-source github click-releases pallets/click
 uv run signal-radar rule include security
 uv run signal-radar collect
 uv run signal-radar items
 uv run signal-radar why 1
 ```
 
-Для Telegram доставки добавьте optional dependency (`uv sync --extra telegram --extra dev`). Для ежедневного (или `DIGEST_CADENCE=weekly`, по понедельникам) дайджеста скопируйте `.env.example` в `.env`, задайте `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, timezone/quiet hours и запустите:
+Для GitHub добавляйте публичный репозиторий в формате `owner/repo`. По умолчанию используется `signal_radar.sqlite3` в текущей папке. Можно задать другой путь через `--db PATH` перед подкомандой. Повторный `collect` обновляет checkpoint и не создаёт копию неизменившейся публикации.
+
+## Telegram дайджест
+
+Установите опциональную зависимость и задайте локально `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` в `.env`:
 
 ```sh
-uv run signal-radar run --interval 900
+uv sync --extra dev --extra telegram
+uv run signal-radar digest
+uv run signal-radar digest --send
 ```
 
-Scheduler собирает источники не чаще указанного интервала и проверяет окно доставки каждую минуту. Сначала используйте `uv run signal-radar digest` для preview. Ручная отправка требует `uv run signal-radar digest --send`.
+`digest` только показывает preview. `digest --send` отправляет реальные сообщения в указанный чат. Для расписания можно использовать `run --interval 900` и настройки `DIGEST_CADENCE`, `DIGEST_TIMEZONE`, `DIGEST_HOUR`, `QUIET_HOURS_START`, `QUIET_HOURS_END`. Планировщик запускайте только после настройки приватного тестового чата.
 
 ## Проверки
 
@@ -41,6 +61,16 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-## Ограничения
+По умолчанию API тесты используют подменённый HTTP транспорт. Опционально можно сделать read-only запросы к публичной RSS ленте Hacker News и публичному GitHub Releases API, используя временную SQLite базу:
 
-GitHub адаптер сейчас читает Releases, а не issues/commits. Пагинация ограничена 10 страницами за один запуск. Для RSS хранится checkpoint заголовка, но условный запрос If-None-Match пока не включён. Include/exclude фильтры общие для пользователя и источников; нет UI для настроек темы. Содержимое RSS считается недоверенным и показывается только как URL/title в дайджесте. Успешная и неуспешная доставка не повторяется автоматически, кроме явного 429; неопределённый сетевой результат может означать, что Telegram принял сообщение, поэтому повтор запрещён. OAuth/LLM сводки не включены. Используйте умеренную частоту сбора и соблюдайте правила поставщика API/RSS.
+```sh
+RUN_LIVE_TESTS=1 uv run pytest -m live
+```
+
+Live сценарий ничего не публикует и не отправляет в Telegram. GitHub Actions выполняет unit-тесты и Ruff на Python 3.11 и 3.12; live тесты запускаются только вручную.
+
+## Безопасность и ограничения
+
+Токены и `.env` не коммитьте. RSS и GitHub content являются внешними данными; Signal Radar показывает заголовок, причину и исходную ссылку, не исполняя содержимое.
+
+Дайджест использует at-most-once доставку: неопределённый результат Telegram запроса не повторяется автоматически, чтобы не отправить дубль. GitHub адаптер читает Releases, не issues или commits. Для RSS сохраняется checkpoint заголовка, но условные запросы ETag пока не включены. LLM-сводки и OAuth не реализованы.

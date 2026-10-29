@@ -6,6 +6,7 @@ import json
 import random
 import re
 import sqlite3
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -15,6 +16,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+
+import certifi
 
 
 def utc_now()->str: return datetime.now(UTC).isoformat()
@@ -69,8 +72,9 @@ class HttpClient:
     @staticmethod
     def _request(url:str,headers:dict[str,str],timeout:float)->HttpResult:
         req=urllib.request.Request(url,headers=headers)
+        context=ssl.create_default_context(cafile=certifi.where())
         try:
-            with urllib.request.urlopen(req,timeout=timeout) as response: return HttpResult(response.read(3_000_000),dict(response.headers.items()),response.status)
+            with urllib.request.urlopen(req,timeout=timeout,context=context) as response: return HttpResult(response.read(3_000_000),dict(response.headers.items()),response.status)
         except urllib.error.HTTPError as exc:
             return HttpResult(exc.read(100_000),dict(exc.headers.items()),exc.code)
     def get(self,url:str,headers:dict[str,str]|None=None)->HttpResult:
@@ -133,7 +137,8 @@ class GitHubAdapter(SourceAdapter):
     """Official public GitHub REST API, paginates with Link; no page scraping."""
     def __init__(self,http:HttpClient,token:str|None=None): super().__init__(http); self.token=token
     def fetch(self,config:dict)->tuple[list[Item],str|None]:
-        owner,repo=config["repo"].split("/",1); url=f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=100"
+        # Release notes can be large; a smaller page keeps the bounded HTTP body intact.
+        owner,repo=config["repo"].split("/",1); url=f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=20"
         headers={"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"}
         if self.token: headers["Authorization"]=f"Bearer {self.token}"
         items=[]; page_count=0
