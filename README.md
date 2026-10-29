@@ -1,5 +1,7 @@
 # Signal Radar
 
+![Signal Radar — public RSS and GitHub releases, collected and explained](assets/banner.svg)
+
 Локальный монитор RSS/Atom лент и публичных GitHub Releases. Он нормализует и дедуплицирует публикации, применяет объяснимые keyword-правила и хранит состояние в SQLite.
 
 [![CI](https://github.com/jezannn16/signal-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/jezannn16/signal-radar/actions/workflows/ci.yml)
