@@ -66,6 +66,14 @@ class HttpResult:
     status:int=200
 
 
+@dataclass
+class SourceFetch:
+    items: list[Item]
+    etag: str | None = None
+    last_modified: str | None = None
+    not_modified: bool = False
+
+
 class HttpClient:
     def __init__(self,transport:Callable[[str,dict[str,str],float],HttpResult]|None=None,timeout:float=8,retries:int=2):
         self.transport=transport or self._request; self.timeout=timeout; self.retries=retries
@@ -95,6 +103,8 @@ class HttpClient:
                         try: delay=min(30,max(0,(parsedate_to_datetime(retry_after)-datetime.now(UTC)).total_seconds()))
                         except (TypeError, ValueError, OverflowError): delay=0
                 time.sleep(delay or random.uniform(0,min(8,0.5*(2**attempt)))); continue
+            if result.status == 304:
+                return result
             if not 200<=result.status<300: raise RuntimeError(f"Source returned HTTP {result.status}")
             return result
         raise RuntimeError("Source request failed")
@@ -126,17 +136,25 @@ def parse_feed(xml:bytes,source_name:str)->list[Item]:
 
 class SourceAdapter:
     def __init__(self,http:HttpClient): self.http=http
-    def fetch(self,config:dict)->tuple[list[Item],str|None]: raise NotImplementedError
+    def fetch(self,config:dict,etag:str|None=None,last_modified:str|None=None)->SourceFetch: raise NotImplementedError
 
 class RSSAdapter(SourceAdapter):
-    def fetch(self,config:dict)->tuple[list[Item],str|None]:
-        res=self.http.get(config["url"])
-        return parse_feed(res.body,config["name"]),res.headers.get("ETag") or res.headers.get("Last-Modified")
+    def fetch(self,config:dict,etag:str|None=None,last_modified:str|None=None)->SourceFetch:
+        headers={}
+        if etag: headers["If-None-Match"]=etag
+        if last_modified: headers["If-Modified-Since"]=last_modified
+        res=self.http.get(config["url"],headers)
+        return SourceFetch(
+            items=[] if res.status==304 else parse_feed(res.body,config["name"]),
+            etag=res.headers.get("ETag") or etag,
+            last_modified=res.headers.get("Last-Modified") or last_modified,
+            not_modified=res.status==304,
+        )
 
 class GitHubAdapter(SourceAdapter):
     """Official public GitHub REST API, paginates with Link; no page scraping."""
     def __init__(self,http:HttpClient,token:str|None=None): super().__init__(http); self.token=token
-    def fetch(self,config:dict)->tuple[list[Item],str|None]:
+    def fetch(self,config:dict,etag:str|None=None,last_modified:str|None=None)->SourceFetch:
         # Release notes can be large; a smaller page keeps the bounded HTTP body intact.
         owner,repo=config["repo"].split("/",1); url=f"https://api.github.com/repos/{owner}/{repo}/releases?per_page=20"
         headers={"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"}
@@ -159,7 +177,7 @@ class GitHubAdapter(SourceAdapter):
                     raise ValueError("GitHub API returned a non-GitHub pagination URL")
             page_count += 1
         if url: raise RuntimeError("GitHub pagination exceeded 10 pages; reduce collection interval")
-        return items,None
+        return SourceFetch(items=items)
 
 
 class RadarStore:
@@ -167,7 +185,7 @@ class RadarStore:
         self.path=path
         with self.db() as db:
             db.executescript("""
-            CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,kind TEXT NOT NULL,config TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_fetched_at TEXT,last_checkpoint TEXT,last_error TEXT);
+            CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,kind TEXT NOT NULL,config TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_fetched_at TEXT,last_checkpoint TEXT,last_error TEXT,etag TEXT,last_modified TEXT);
             CREATE TABLE IF NOT EXISTS normalized_items(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,canonical_url TEXT NOT NULL,title TEXT NOT NULL,published_at TEXT,fetched_at TEXT NOT NULL,content TEXT NOT NULL,content_hash TEXT NOT NULL,score INTEGER NOT NULL DEFAULT 0,why TEXT NOT NULL DEFAULT '',UNIQUE(source_id,canonical_url));
             CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,title TEXT NOT NULL,content_hash TEXT NOT NULL,observed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS keyword_rules(id INTEGER PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('include','exclude')),keyword TEXT NOT NULL UNIQUE);
@@ -176,6 +194,10 @@ class RadarStore:
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
             INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
             """)
+            columns={row[1] for row in db.execute("PRAGMA table_info(sources)")}
+            if "etag" not in columns: db.execute("ALTER TABLE sources ADD COLUMN etag TEXT")
+            if "last_modified" not in columns: db.execute("ALTER TABLE sources ADD COLUMN last_modified TEXT")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
     def db(self):
         db=sqlite3.connect(self.path,timeout=10); db.row_factory=sqlite3.Row; return db
     def add_source(self,name:str,kind:str,config:dict)->None:
@@ -222,14 +244,16 @@ class RadarStore:
                     db.execute("INSERT INTO normalized_items(source_id,canonical_url,title,published_at,fetched_at,content,content_hash,score,why) VALUES(?,?,?,?,?,?,?,?,?)",(source_id,canonical,item.title,item.published_at,now,item.content,item.content_hash,scored[0],scored[1])); inserted+=1
         return inserted,updated,ignored
     def collect(self,http:HttpClient,token:str|None=None)->dict:
-        totals={"inserted":0,"updated":0,"ignored":0,"failed":[]}
+        totals={"inserted":0,"updated":0,"ignored":0,"not_modified":0,"failed":[]}
         for source in self.sources():
             config=json.loads(source["config"])
             try:
                 adapter=RSSAdapter(http) if source["kind"]=="rss" else GitHubAdapter(http,token)
-                items,checkpoint=adapter.fetch(config); added,updated,ignored=self.upsert_items(source["id"],items)
-                with self.db() as db:db.execute("UPDATE sources SET last_fetched_at=?,last_checkpoint=?,last_error=NULL WHERE id=?",(utc_now(),checkpoint,source["id"]))
+                result=adapter.fetch(config,source["etag"],source["last_modified"])
+                added,updated,ignored=self.upsert_items(source["id"],result.items)
+                with self.db() as db:db.execute("UPDATE sources SET last_fetched_at=?,last_checkpoint=?,etag=?,last_modified=?,last_error=NULL WHERE id=?",(utc_now(),result.etag or result.last_modified,result.etag,result.last_modified,source["id"]))
                 totals["inserted"]+=added; totals["updated"]+=updated; totals["ignored"]+=ignored
+                if result.not_modified: totals["not_modified"]+=1
             except (RuntimeError, ValueError, TypeError, AttributeError, KeyError, json.JSONDecodeError, sqlite3.Error, ET.ParseError, urllib.error.URLError) as exc:
                 safe=f"{type(exc).__name__}: {str(exc)[:300]}"; totals["failed"].append({"source":source["name"],"error":safe})
                 with self.db() as db:db.execute("UPDATE sources SET last_fetched_at=?,last_error=? WHERE id=?",(utc_now(),safe,source["id"]))
