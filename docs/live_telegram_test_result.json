@@ -1,0 +1,17 @@
+{
+  "tested_at_utc": "2026-10-30T07:07:44.502974+00:00",
+  "project": "Signal Radar",
+  "fixture": "synthetic_only",
+  "telegram_api_method": "sendMessage",
+  "destination_guard": "single ALLOWED_USER_IDS value; exact match enforced before request",
+  "send_attempts": 1,
+  "maximum_send_attempts": 1,
+  "outcome": "confirmed_sent",
+  "delivery_state_counts": {
+    "sent": 1
+  },
+  "pending_items_after_attempt": 0,
+  "getUpdates_or_polling": false,
+  "database": "temporary SQLite; removed after state verification",
+  "error_type": null
+}
