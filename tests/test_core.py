@@ -9,6 +9,22 @@ import pytest
 from signal_radar.core import HttpClient, HttpResult, Item, RadarStore, canonical_url, parse_feed
 
 
+def test_shared_memory_store_survives_method_connections():
+    store = RadarStore(":memory:")
+    store.add_source("public-feed", "rss", {"url": "https://example.test/feed"})
+    assert len(store.sources()) == 1
+    assert store.sources()[0]["name"] == "public-feed"
+
+
+def test_shared_memory_store_serializes_concurrent_connections():
+    store=RadarStore(":memory:")
+    def add(index):
+        store.add_source(f"feed-{index}","rss",{"url":f"https://example.test/{index}"})
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        list(pool.map(add,range(60)))
+    assert len(store.sources())==60
+
+
 def test_canonical_url_and_rss_parse():
     assert canonical_url("HTTPS://Example.com/a?utm_source=x&b=2#frag")=="https://example.com/a?b=2"
     payload=b'''<rss><channel><item><title>Release</title><link>https://example.test/a</link><pubDate>Mon, 02 Mar 2026 09:00:00 GMT</pubDate><description>new API</description></item></channel></rss>'''
@@ -419,3 +435,4 @@ def test_rss_source_rejects_embedded_credentials(tmp_path):
     store=RadarStore(str(tmp_path/"radar.db"))
     with pytest.raises(ValueError,match="Do not put credentials"):
         store.add_source("private","rss",{"url":"https://user:password@example.test/feed"})
+from concurrent.futures import ThreadPoolExecutor

@@ -12,11 +12,14 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from threading import RLock
 
 import certifi
 
@@ -184,6 +187,9 @@ class GitHubAdapter(SourceAdapter):
 class RadarStore:
     def __init__(self,path:str):
         self.path=path
+        self._memory_uri=f"file:signal-{uuid.uuid4().hex}?mode=memory&cache=shared" if self.path==":memory:" else None
+        self._memory_anchor=sqlite3.connect(self._memory_uri,uri=True) if self._memory_uri else None
+        self._memory_lock=RLock() if self._memory_uri else None
         with self.db() as db:
             db.executescript("""
             CREATE TABLE IF NOT EXISTS sources(id INTEGER PRIMARY KEY,name TEXT UNIQUE NOT NULL,kind TEXT NOT NULL,config TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,last_fetched_at TEXT,last_checkpoint TEXT,last_error TEXT,etag TEXT,last_modified TEXT);
@@ -202,15 +208,24 @@ class RadarStore:
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
             if "topic" not in columns: db.execute("ALTER TABLE sources ADD COLUMN topic TEXT")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)")
+    @contextmanager
     def db(self):
-        if self.path != ":memory:":
-            fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
-        db=sqlite3.connect(self.path,timeout=10)
-        if self.path != ":memory:":
-            for candidate in (self.path,self.path+"-wal",self.path+"-shm",self.path+"-journal"):
-                try:os.chmod(candidate,0o600)
-                except FileNotFoundError:pass
-        db.row_factory=sqlite3.Row; return db
+        # Shared-cache memory SQLite returns SQLITE_LOCKED without waiting, so
+        # serialize operations made through separate connections to this store.
+        with self._memory_lock if self._memory_lock else nullcontext():
+            if self.path != ":memory:":
+                fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
+            db=sqlite3.connect(self._memory_uri or self.path,timeout=10,uri=bool(self._memory_uri))
+            try:
+                if self.path != ":memory:":
+                    for candidate in (self.path,self.path+"-wal",self.path+"-shm",self.path+"-journal"):
+                        try:os.chmod(candidate,0o600)
+                        except FileNotFoundError:pass
+                db.row_factory=sqlite3.Row
+                with db:
+                    yield db
+            finally:
+                db.close()
     def add_source(self,name:str,kind:str,config:dict,topic:str|None=None)->None:
         if not name.strip() or kind not in {"rss","github"}: raise ValueError("Source requires a name and kind rss|github")
         if kind=="rss":
