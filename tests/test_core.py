@@ -72,6 +72,21 @@ def test_http_error_is_bounded_and_reported():
         http.get("https://source.example")
 
 
+def test_http_client_honors_retry_after_429_without_real_wait():
+    from unittest.mock import patch
+
+    from signal_radar.core import HttpResult
+
+    calls=[]
+    def fake(url,headers,timeout):
+        calls.append(url)
+        return HttpResult(b"limited",{"Retry-After":"3"},429) if len(calls)==1 else HttpResult(b"ok",{})
+    with patch("signal_radar.core.time.sleep") as sleep:
+        result=HttpClient(fake,retries=1).get("https://source.example")
+    assert result.body==b"ok" and len(calls)==2
+    sleep.assert_called_once_with(3.0)
+
+
 def test_schedule_timezone_quiet_hours_and_weekly():
     from datetime import datetime
 
@@ -215,6 +230,65 @@ def test_digest_fake_telegram_recovers_stale_claim_and_sends_only_pending(tmp_pa
         states={row["item_id"]:row["state"] for row in db.execute("SELECT item_id,state FROM delivery_log")}
     assert states[old["id"]]=="unknown"
     assert list(states.values()).count("sent")==2
+
+
+def test_digest_sends_all_backlog_in_chunks_before_scheduling_slot(tmp_path):
+    import sys
+    from types import ModuleType
+    from unittest.mock import patch
+
+    from signal_radar.cli import record_scheduled_delivery, send_digest
+
+    store=RadarStore(str(tmp_path/"chunks.db"));store.add_source("x","rss",{"url":"https://x.test"})
+    source=store.sources()[0]
+    store.upsert_items(source["id"],[Item(f"https://x.test/{i}",f"Release {i} " + "T"*1800,"x",None) for i in range(3)])
+    key="digest_sent:2026-10-30"
+    assert not record_scheduled_delivery(store,key,"Отправлено сигналов: 1")
+    assert not store.digest_marked(key)
+    sent=[]
+    class Session:
+        async def close(self):pass
+    class FakeBot:
+        def __init__(self,token):self.session=Session()
+        async def send_message(self,chat_id,text):sent.append(text)
+    aiogram=ModuleType("aiogram");aiogram.Bot=FakeBot
+    exceptions=ModuleType("aiogram.exceptions")
+    class NoRetry(Exception):pass
+    exceptions.TelegramRetryAfter=NoRetry
+    with patch.dict(sys.modules,{"aiogram":aiogram,"aiogram.exceptions":exceptions}):
+        result=asyncio.run(send_digest(store,"synthetic-token","synthetic-chat"))
+    assert result=="Отправлено сигналов: 3"
+    assert len(sent)==2 and all(len(message)<=3800 for message in sent)
+    assert all(f"Release {i} " in "\n".join(sent) for i in range(3))
+    assert store.pending_delivery()==[]
+    assert record_scheduled_delivery(store,key,result)
+
+
+def test_digest_retries_explicit_telegram_retry_after(tmp_path):
+    import sys
+    from types import ModuleType
+    from unittest.mock import AsyncMock, patch
+
+    from signal_radar.cli import send_digest
+
+    store=RadarStore(str(tmp_path/"retry-after.db"));store.add_source("x","rss",{"url":"https://x.test"})
+    store.upsert_items(store.sources()[0]["id"],[Item("https://x.test/one","Release","x",None)])
+    class RetryAfter(Exception):
+        retry_after=0
+    class Session:
+        async def close(self):pass
+    class FakeBot:
+        calls=0
+        def __init__(self,token):self.session=Session()
+        async def send_message(self,chat_id,text):
+            type(self).calls+=1
+            if type(self).calls==1:raise RetryAfter()
+    aiogram=ModuleType("aiogram");aiogram.Bot=FakeBot
+    exceptions=ModuleType("aiogram.exceptions");exceptions.TelegramRetryAfter=RetryAfter
+    with patch.dict(sys.modules,{"aiogram":aiogram,"aiogram.exceptions":exceptions}), patch("signal_radar.cli.asyncio.sleep",new_callable=AsyncMock) as sleep:
+        result=asyncio.run(send_digest(store,"synthetic-token","synthetic-chat"))
+    assert result=="Отправлено сигналов: 1"
+    assert FakeBot.calls==2 and sleep.await_count==1 and store.pending_delivery()==[]
 
 
 def test_database_file_is_private_by_default(tmp_path):

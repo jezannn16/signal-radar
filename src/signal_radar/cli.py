@@ -45,38 +45,59 @@ async def send_digest(store:RadarStore,token:str,chat_id:str,intro:str="")->str:
     rows=store.pending_delivery()
     if not rows:return "Новых сигналов нет."
     if not store.delivery_allowed():return "Пауза между отправками ещё не прошла; сообщения не отправлены."
-    # Keep one irreversible send under Telegram's message limit; remaining items stay pending.
-    chosen=[]; claimed=[]; text=intro.strip()
-    for row in rows:
-        block=render_digest([row])
-        candidate=(text+"\n\n"+block).strip()
-        if len(candidate)>3800:break
-        aliases=store.reserve_delivery_group(row["id"])
-        if aliases:
-            chosen.append(row);claimed.extend(aliases);text=candidate
-    if not claimed:return "Эти элементы уже зарезервированы для доставки."
     bot=Bot(token)
+    sent=0; intro_pending=intro.strip(); batch_text=intro_pending; batch_claims=[]; batch_count=0
+
+    async def flush_batch()->None:
+        nonlocal sent,batch_text,batch_claims,batch_count,intro_pending
+        if not batch_claims:return
+        try:
+            # 429 is an explicit rejection, so a bounded Retry-After retry cannot duplicate a send.
+            for attempt in range(3):
+                try:
+                    await bot.send_message(chat_id,batch_text)
+                    break
+                except TelegramRetryAfter as exc:
+                    if attempt==2 or exc.retry_after>60:raise
+                    await asyncio.sleep(exc.retry_after)
+        except Exception as exc:
+            for item_id in batch_claims:store.finish_delivery(item_id,False,type(exc).__name__)
+            raise RuntimeError(f"Telegram delivery failed ({type(exc).__name__}); batch is recorded and will not be retried automatically") from exc
+        for item_id in batch_claims:store.finish_delivery(item_id,True)
+        sent+=batch_count;batch_text="";batch_claims=[];batch_count=0;intro_pending=""
+
     try:
-        # Telegram explicitly rejects 429 messages, so bounded Retry-After retries are safe.
-        for attempt in range(3):
-            try:
-                await bot.send_message(chat_id,text)
-                break
-            except TelegramRetryAfter as exc:
-                if attempt==2 or exc.retry_after>60: raise
-                await asyncio.sleep(exc.retry_after)
-    except Exception as exc:
-        for item_id in claimed:store.finish_delivery(item_id,False,type(exc).__name__)
-        raise RuntimeError(f"Telegram delivery failed ({type(exc).__name__}); batch is recorded and will not be retried automatically") from exc
-    else:
-        for item_id in claimed:store.finish_delivery(item_id,True)
-    finally: await bot.session.close()
-    return f"Отправлено сигналов: {len(chosen)}"
+        for row in rows:
+            block=render_digest([row])
+            if len(block)>3800:
+                url=str(row["canonical_url"])
+                if len(url)>3000:raise RuntimeError("A source URL is too long to fit in a Telegram digest; item remains pending")
+                block=block[:-len(url)]+"Карточка сокращена до лимита Telegram.\n"+url
+                if len(block)>3800:
+                    prefix=block[:-len(url)]
+                    block=prefix[:3800-len(url)-2]+"\n"+url
+            separator="\n\n" if batch_text else ""
+            candidate=(batch_text+separator+block).strip()
+            if len(candidate)>3800:
+                await flush_batch()
+                candidate=block
+            if len(candidate)>3800:
+                raise RuntimeError("A source item cannot fit in a Telegram message; item remains pending")
+            aliases=store.reserve_delivery_group(row["id"])
+            if not aliases:continue
+            batch_claims.extend(aliases);batch_count+=1;batch_text=candidate
+        await flush_batch()
+    finally:
+        await bot.session.close()
+    if not sent:return "Элементы уже зарезервированы для доставки или не помещаются в сообщение."
+    return f"Отправлено сигналов: {sent}"
 
 
 def record_scheduled_delivery(store:RadarStore,key:str,result:str)->bool:
     """Consume a schedule slot only after Telegram confirms a non-empty send."""
     if not result.startswith("Отправлено сигналов: "):
+        return False
+    if store.pending_delivery():
         return False
     store.mark_digest(key)
     return True
