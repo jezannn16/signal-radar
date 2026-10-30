@@ -323,11 +323,26 @@ class RadarStore:
     def recover_stale_deliveries(self,older_than_seconds:int=600,now:datetime|None=None)->int:
         """Mark interrupted Telegram sends uncertain; never resend automatically."""
         if older_than_seconds<1: raise ValueError("Recovery age must be positive")
-        cutoff=(now or datetime.now(UTC)).astimezone(UTC).timestamp()-older_than_seconds
-        cutoff_iso=datetime.fromtimestamp(cutoff,UTC).isoformat()
+        clock=now or datetime.now(UTC)
+        if clock.tzinfo is None: raise ValueError("Recovery clock must be timezone-aware")
+        cutoff=clock.astimezone(UTC).timestamp()-older_than_seconds
         with self.db() as db:
-            cur=db.execute("UPDATE delivery_log SET state='unknown',error='Delivery outcome uncertain after interrupted send' WHERE state='sending' AND created_at<?",(cutoff_iso,))
-            return cur.rowcount
+            stale=[]
+            for row in db.execute("SELECT id,created_at FROM delivery_log WHERE state='sending'"):
+                try:
+                    started=datetime.fromisoformat(row["created_at"])
+                    if started.tzinfo is None: started=started.replace(tzinfo=UTC)
+                    if started.astimezone(UTC).timestamp()<cutoff: stale.append((row["id"],))
+                except (TypeError,ValueError,OverflowError):
+                    # A corrupt timestamp cannot establish that retrying is safe.
+                    stale.append((row["id"],))
+            db.executemany("UPDATE delivery_log SET state='unknown',error='Delivery outcome uncertain after interrupted send' WHERE id=? AND state='sending'",stale)
+            return len(stale)
+    @staticmethod
+    def _timestamp_utc(value:str)->datetime:
+        parsed=datetime.fromisoformat(value)
+        if parsed.tzinfo is None: parsed=parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
     @staticmethod
     def _delivery_window_open(db:sqlite3.Connection,now:datetime)->bool:
         row=db.execute("SELECT value FROM metadata WHERE key='min_interval_seconds'").fetchone()
@@ -336,14 +351,13 @@ class RadarStore:
         markers=[]
         reservation=db.execute("SELECT value FROM metadata WHERE key='last_digest_window_at'").fetchone()
         if reservation:
-            markers.append(datetime.fromisoformat(reservation[0]))
+            markers.append(RadarStore._timestamp_utc(reservation[0]))
         last_delivery=db.execute("SELECT created_at FROM delivery_log ORDER BY id DESC LIMIT 1").fetchone()
         if last_delivery:
-            markers.append(datetime.fromisoformat(last_delivery[0]))
+            markers.append(RadarStore._timestamp_utc(last_delivery[0]))
         if not markers:return True
         then=max(markers)
-        if then.tzinfo is None:then=then.replace(tzinfo=UTC)
-        return (now.astimezone(UTC)-then.astimezone(UTC)).total_seconds()>=interval
+        return (now.astimezone(UTC)-then).total_seconds()>=interval
 
     def delivery_allowed(self,now:datetime|None=None)->bool:
         """Read the persisted cooldown state; claim_digest_window also serializes the check."""

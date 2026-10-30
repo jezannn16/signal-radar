@@ -78,6 +78,24 @@ def test_minimum_interval_rejects_naive_clock(tmp_path):
         store.claim_digest_window(datetime(2026,10,30,12))
 
 
+def test_minimum_interval_normalizes_mixed_legacy_and_aware_timestamps(tmp_path):
+    store=RadarStore(str(tmp_path/"legacy-window.db"));store.set_min_interval(60)
+    with store.db() as db:
+        db.execute("INSERT INTO metadata(key,value) VALUES('last_digest_window_at',?)",("2026-10-30T12:00:00+00:00",))
+        db.execute("INSERT INTO delivery_log(item_id,state,created_at) VALUES(1,'sent',?)",("2026-10-30T12:01:00",))
+    assert not store.delivery_allowed(datetime(2026,10,30,12,1,30,tzinfo=UTC))
+    assert store.delivery_allowed(datetime(2026,10,30,12,2,tzinfo=UTC))
+
+
+def test_zero_interval_allows_repeated_claims_without_persisting_a_reservation(tmp_path):
+    store=RadarStore(str(tmp_path/"zero-window.db"))
+    now=datetime(2026,10,30,12,tzinfo=UTC)
+    assert store.claim_digest_window(now)
+    assert store.claim_digest_window(now)
+    with store.db() as db:
+        assert db.execute("SELECT 1 FROM metadata WHERE key='last_digest_window_at'").fetchone() is None
+
+
 def test_minimum_interval_is_local_to_database_and_blocks_cli_digest_without_sending(tmp_path):
     import sys
     from datetime import datetime
@@ -244,6 +262,23 @@ def test_stale_delivery_is_marked_uncertain_and_never_requeued(tmp_path):
     assert delivery["state"]=="unknown" and "uncertain" in delivery["error"]
 
 
+def test_recovery_handles_legacy_naive_and_offset_timestamps_and_rejects_naive_clock(tmp_path):
+    store=RadarStore(str(tmp_path/"legacy-recovery.db"))
+    with store.db() as db:
+        db.executemany("INSERT INTO delivery_log(item_id,state,created_at) VALUES(?,'sending',?)",[
+            (1,"2026-10-30T11:00:00"),
+            (2,"2026-10-30T11:59:30"),
+            (3,"2026-10-30T13:00:00+02:00"),
+            (4,"2026-10-30T13:59:30+02:00"),
+        ])
+    with pytest.raises(ValueError,match="timezone-aware"):
+        store.recover_stale_deliveries(now=datetime(2026,10,30,12))
+    assert store.recover_stale_deliveries(now=datetime(2026,10,30,12,tzinfo=UTC))==2
+    with store.db() as db:
+        states={row["id"]:row["state"] for row in db.execute("SELECT id,state FROM delivery_log")}
+    assert states=={1:"unknown",2:"sending",3:"unknown",4:"sending"}
+
+
 def test_cross_source_canonical_duplicates_share_one_delivery_claim(tmp_path):
     store=RadarStore(str(tmp_path/"cross-source.db"))
     store.add_source("alpha","rss",{"url":"https://alpha.test/rss"})
@@ -306,6 +341,7 @@ def test_digest_sends_all_backlog_in_chunks_before_scheduling_slot(tmp_path):
     from signal_radar.cli import record_scheduled_delivery, send_digest
 
     store=RadarStore(str(tmp_path/"chunks.db"));store.add_source("x","rss",{"url":"https://x.test"})
+    store.set_min_interval(3600)
     source=store.sources()[0]
     store.upsert_items(source["id"],[Item(f"https://x.test/{i}",f"Release {i} " + "T"*1800,"x",None) for i in range(3)])
     key="digest_sent:2026-10-30"
@@ -325,6 +361,7 @@ def test_digest_sends_all_backlog_in_chunks_before_scheduling_slot(tmp_path):
         result=asyncio.run(send_digest(store,"synthetic-token","synthetic-chat"))
     assert result=="Отправлено сигналов: 3"
     assert len(sent)==2 and all(len(message)<=3800 for message in sent)
+    assert not store.delivery_allowed()
     assert all(f"Release {i} " in "\n".join(sent) for i in range(3))
     assert store.pending_delivery()==[]
     assert record_scheduled_delivery(store,key,result)
