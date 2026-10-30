@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from datetime import UTC
+from stat import S_IMODE
 
 from signal_radar.core import HttpClient, HttpResult, Item, RadarStore, canonical_url, parse_feed
 
@@ -111,3 +112,30 @@ def test_rss_validator_columns_migrate_existing_database(tmp_path):
         columns={row[1] for row in db.execute("PRAGMA table_info(sources)")}
         assert {"etag","last_modified"}.issubset(columns)
         assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]==2
+
+
+def test_database_file_is_private_by_default(tmp_path):
+    path=tmp_path/"private.db"
+    RadarStore(str(path))
+    assert S_IMODE(path.stat().st_mode)==0o600
+
+
+def test_source_failure_does_not_persist_url_secrets(tmp_path):
+    from unittest.mock import patch
+
+    store=RadarStore(str(tmp_path/"radar.db"))
+    store.add_source("private feed","rss",{"url":"https://example.test/feed?token=synthetic-secret"})
+    with patch("signal_radar.core.RSSAdapter.fetch",side_effect=RuntimeError("request failed for token=synthetic-secret")):
+        result=store.collect(HttpClient(retries=0))
+    assert result["failed"][0]["error"]=="RuntimeError (details omitted)"
+    with store.db() as db:
+        persisted=db.execute("SELECT last_error FROM sources WHERE name='private feed'").fetchone()[0]
+    assert "synthetic-secret" not in persisted
+
+
+def test_rss_source_rejects_embedded_credentials(tmp_path):
+    import pytest
+
+    store=RadarStore(str(tmp_path/"radar.db"))
+    with pytest.raises(ValueError,match="Do not put credentials"):
+        store.add_source("private","rss",{"url":"https://user:password@example.test/feed"})

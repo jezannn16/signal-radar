@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
 import sqlite3
@@ -199,10 +200,23 @@ class RadarStore:
             if "last_modified" not in columns: db.execute("ALTER TABLE sources ADD COLUMN last_modified TEXT")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
     def db(self):
-        db=sqlite3.connect(self.path,timeout=10); db.row_factory=sqlite3.Row; return db
+        if self.path != ":memory:":
+            fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
+        db=sqlite3.connect(self.path,timeout=10)
+        if self.path != ":memory:":
+            for candidate in (self.path,self.path+"-wal",self.path+"-shm",self.path+"-journal"):
+                try:os.chmod(candidate,0o600)
+                except FileNotFoundError:pass
+        db.row_factory=sqlite3.Row; return db
     def add_source(self,name:str,kind:str,config:dict)->None:
         if not name.strip() or kind not in {"rss","github"}: raise ValueError("Source requires a name and kind rss|github")
-        if kind=="rss" and not config.get("url"): raise ValueError("RSS source requires url")
+        if kind=="rss":
+            url=config.get("url","")
+            parts=urllib.parse.urlsplit(url)
+            if parts.scheme not in {"http","https"} or not parts.hostname:
+                raise ValueError("RSS source URL must be absolute HTTP(S)")
+            if parts.username is not None or parts.password is not None:
+                raise ValueError("Do not put credentials in RSS URLs; use a public feed URL")
         if kind=="github" and not re.fullmatch(r"[^/]+/[^/]+",config.get("repo","")): raise ValueError("GitHub repository must use owner/repo")
         config={**config,"name":name.strip()}
         with self.db() as db: db.execute("INSERT INTO sources(name,kind,config) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,config=excluded.config,enabled=1",(name,kind,json.dumps(config)))
@@ -254,8 +268,10 @@ class RadarStore:
                 with self.db() as db:db.execute("UPDATE sources SET last_fetched_at=?,last_checkpoint=?,etag=?,last_modified=?,last_error=NULL WHERE id=?",(utc_now(),result.etag or result.last_modified,result.etag,result.last_modified,source["id"]))
                 totals["inserted"]+=added; totals["updated"]+=updated; totals["ignored"]+=ignored
                 if result.not_modified: totals["not_modified"]+=1
-            except (RuntimeError, ValueError, TypeError, AttributeError, KeyError, json.JSONDecodeError, sqlite3.Error, ET.ParseError, urllib.error.URLError) as exc:
-                safe=f"{type(exc).__name__}: {str(exc)[:300]}"; totals["failed"].append({"source":source["name"],"error":safe})
+            except (RuntimeError, ValueError, TypeError, AttributeError, KeyError, json.JSONDecodeError, UnicodeError, sqlite3.Error, ET.ParseError, urllib.error.URLError) as exc:
+                message=str(exc)
+                safe=message if re.fullmatch(r"Source returned HTTP \d{3}|Source request failed: [A-Za-z]+|GitHub pagination exceeded 10 pages; reduce collection interval",message) else f"{type(exc).__name__} (details omitted)"
+                totals["failed"].append({"source":source["name"],"error":safe})
                 with self.db() as db:db.execute("UPDATE sources SET last_fetched_at=?,last_error=? WHERE id=?",(utc_now(),safe,source["id"]))
         return totals
     def items(self,limit:int=50):
