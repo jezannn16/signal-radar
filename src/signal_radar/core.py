@@ -300,10 +300,26 @@ class RadarStore:
         with self.db() as db:
             try:db.execute("INSERT INTO delivery_log(item_id,state,created_at) VALUES(?,'sending',?)",(item_id,utc_now()));return True
             except sqlite3.IntegrityError:return False
+    def reserve_delivery_group(self,item_id:int)->list[int]:
+        """Atomically claim all source copies of one canonical URL for one digest send."""
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row=db.execute("SELECT canonical_url FROM normalized_items WHERE id=?",(item_id,)).fetchone()
+            if row is None:return []
+            aliases=[int(x[0]) for x in db.execute("SELECT id FROM normalized_items WHERE canonical_url=? ORDER BY id",(row["canonical_url"],))]
+            marks=",".join("?" for _ in aliases)
+            if db.execute(f"SELECT 1 FROM delivery_log WHERE item_id IN ({marks}) LIMIT 1",aliases).fetchone():return []
+            db.executemany("INSERT INTO delivery_log(item_id,state,created_at) VALUES(?,'sending',?)",[(alias,utc_now()) for alias in aliases])
+            return aliases
     def finish_delivery(self,item_id:int,ok:bool,error:str="")->None:
         with self.db() as db:db.execute("UPDATE delivery_log SET state=?,delivered_at=?,error=? WHERE item_id=? AND state='sending'",("sent" if ok else "failed",utc_now() if ok else None,error[:300],item_id))
     def pending_delivery(self,limit:int=30):
-        with self.db() as db:return list(db.execute("SELECT i.*,s.name source_name FROM normalized_items i JOIN sources s ON s.id=i.source_id LEFT JOIN delivery_log d ON d.item_id=i.id WHERE d.id IS NULL ORDER BY COALESCE(i.published_at,i.fetched_at) DESC LIMIT ?",(limit,)))
+        with self.db() as db:return list(db.execute("""SELECT i.*,s.name source_name,
+            (SELECT group_concat(DISTINCT s2.name) FROM normalized_items i2 JOIN sources s2 ON s2.id=i2.source_id WHERE i2.canonical_url=i.canonical_url) source_names
+            FROM normalized_items i JOIN sources s ON s.id=i.source_id
+            WHERE i.id=(SELECT MIN(i2.id) FROM normalized_items i2 WHERE i2.canonical_url=i.canonical_url)
+              AND NOT EXISTS(SELECT 1 FROM normalized_items i2 JOIN delivery_log d2 ON d2.item_id=i2.id WHERE i2.canonical_url=i.canonical_url)
+            ORDER BY COALESCE(i.published_at,i.fetched_at) DESC,i.id DESC LIMIT ?""",(limit,)))
     def recover_stale_deliveries(self,older_than_seconds:int=600,now:datetime|None=None)->int:
         """Mark interrupted Telegram sends uncertain; never resend automatically."""
         if older_than_seconds<1: raise ValueError("Recovery age must be positive")
