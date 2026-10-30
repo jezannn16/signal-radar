@@ -10,6 +10,11 @@ from datetime import UTC
 from dotenv import load_dotenv
 
 from .core import HttpClient, RadarStore
+from .summary import OpenAISummaryProvider, SummaryError, summarize_rows
+
+
+def llm_opted_in(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes"}
 
 
 def render_digest(rows)->str:
@@ -24,7 +29,16 @@ def render_digest(rows)->str:
     return "\n\n".join(blocks)
 
 
-async def send_digest(store:RadarStore,token:str,chat_id:str)->str:
+def render_summary(summary,rows)->str:
+    title_by_url={str(row["canonical_url"]):str(row["title"]) for row in rows}
+    links=[f"• {title_by_url.get(url,'Источник')}: {url}" for url in summary.citation_urls]
+    result="Краткая LLM-сводка (проверьте источники):\n"+summary.text+"\n\nИсточники:\n"+"\n".join(links)
+    if len(result)>2200:
+        raise SummaryError("Цитируемая сводка слишком длинная; показан обычный digest.")
+    return result
+
+
+async def send_digest(store:RadarStore,token:str,chat_id:str,intro:str="")->str:
     from aiogram import Bot
     from aiogram.exceptions import TelegramRetryAfter
     store.recover_stale_deliveries()
@@ -32,7 +46,7 @@ async def send_digest(store:RadarStore,token:str,chat_id:str)->str:
     if not rows:return "Новых сигналов нет."
     if not store.delivery_allowed():return "Пауза между отправками ещё не прошла; сообщения не отправлены."
     # Keep one irreversible send under Telegram's message limit; remaining items stay pending.
-    chosen=[]; claimed=[]; text=""
+    chosen=[]; claimed=[]; text=intro.strip()
     for row in rows:
         block=render_digest([row])
         candidate=(text+"\n\n"+block).strip()
@@ -91,6 +105,7 @@ def main()->None:
     why=sub.add_parser("why");why.add_argument("item_id",type=int)
     interval=sub.add_parser("min-interval");interval.add_argument("seconds",type=int)
     digest=sub.add_parser("digest");digest.add_argument("--send",action="store_true",help="send this digest to configured TELEGRAM_CHAT_ID")
+    digest.add_argument("--summarize",action="store_true",help="add optional source-cited summary (requires OPENAI_API_KEY and OPENAI_MODEL)")
     run=sub.add_parser("run");run.add_argument("--interval",type=int,default=int(os.getenv("POLL_SECONDS","900")))
     args=p.parse_args();store=RadarStore(args.db)
     if args.command=="add-source":
@@ -124,10 +139,24 @@ def main()->None:
         print(render_digest([row]))
     elif args.command=="min-interval":store.set_min_interval(args.seconds);print("Minimum interval updated.")
     elif args.command=="digest":
-        rows=store.pending_delivery();preview=render_digest(rows);print(preview)
+        rows=store.pending_delivery();preview=render_digest(rows);summary_text=""
+        if args.summarize:
+            llm_enabled=llm_opted_in(os.getenv("OPENAI_ENABLED", "false"))
+            api_key=os.getenv("OPENAI_API_KEY","").strip();model=os.getenv("OPENAI_MODEL","").strip()
+            if not llm_enabled:
+                print("LLM summary выключен (нужен явный OPENAI_ENABLED=true); используется обычный digest.")
+            elif not api_key or not model:
+                print("LLM summary выключен (нужны OPENAI_API_KEY и OPENAI_MODEL); используется обычный digest.")
+            elif rows:
+                try:
+                    cited=summarize_rows(rows,OpenAISummaryProvider(api_key,model))
+                    summary_text=render_summary(cited,rows)
+                except SummaryError as exc:
+                    print(f"Сводка недоступна: {exc}")
+        print((summary_text+"\n\n" if summary_text else "")+preview)
         if args.send:
             token=os.getenv("TELEGRAM_BOT_TOKEN","");chat=os.getenv("TELEGRAM_CHAT_ID","")
             if not token or not chat:raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
-            print(asyncio.run(send_digest(store,token,chat)))
+            print(asyncio.run(send_digest(store,token,chat,summary_text)))
 
 if __name__=="__main__":main()
