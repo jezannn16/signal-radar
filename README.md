@@ -38,6 +38,9 @@ uv run signal-radar --help
 uv run signal-radar add-source rss Hacker-News https://hnrss.org/frontpage
 uv run signal-radar add-source github click-releases pallets/click
 uv run signal-radar rule include security
+uv run signal-radar add-source rss vendor https://vendor.example/releases --topic releases
+uv run signal-radar rule exclude preview --topic releases
+uv run signal-radar rule include api --source vendor
 uv run signal-radar collect
 uv run signal-radar items
 uv run signal-radar why 1
@@ -56,6 +59,8 @@ uv run signal-radar digest --send
 ```
 
 `digest` только показывает preview. `digest --send` отправляет реальные сообщения в указанный чат. Для расписания можно использовать `run --interval 900` и настройки `DIGEST_CADENCE`, `DIGEST_TIMEZONE`, `DIGEST_HOUR`, `QUIET_HOURS_START`, `QUIET_HOURS_END`. Планировщик запускайте только после настройки приватного тестового чата.
+
+Правила без scope применяются глобально; `--source` ограничивает правило именем настроенного источника, а `--topic` — меткой, заданной через `add-source --topic`. Если Telegram отправка оборвалась при неизвестном результате, зависшая запись после 10 минут становится `unknown` и автоматически не отправляется повторно: сначала проверьте чат вручную.
 
 ## Проверки
 

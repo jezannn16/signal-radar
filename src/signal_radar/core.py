@@ -190,6 +190,7 @@ class RadarStore:
             CREATE TABLE IF NOT EXISTS normalized_items(id INTEGER PRIMARY KEY,source_id INTEGER NOT NULL,canonical_url TEXT NOT NULL,title TEXT NOT NULL,published_at TEXT,fetched_at TEXT NOT NULL,content TEXT NOT NULL,content_hash TEXT NOT NULL,score INTEGER NOT NULL DEFAULT 0,why TEXT NOT NULL DEFAULT '',UNIQUE(source_id,canonical_url));
             CREATE TABLE IF NOT EXISTS item_versions(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL,title TEXT NOT NULL,content_hash TEXT NOT NULL,observed_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS keyword_rules(id INTEGER PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('include','exclude')),keyword TEXT NOT NULL UNIQUE);
+            CREATE TABLE IF NOT EXISTS scoped_keyword_rules(id INTEGER PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('include','exclude')),keyword TEXT NOT NULL,scope_type TEXT NOT NULL CHECK(scope_type IN ('source','topic')),scope_value TEXT NOT NULL,UNIQUE(kind,keyword,scope_type,scope_value));
             CREATE TABLE IF NOT EXISTS delivery_log(id INTEGER PRIMARY KEY,item_id INTEGER NOT NULL UNIQUE,state TEXT NOT NULL,created_at TEXT NOT NULL,delivered_at TEXT,error TEXT);
             CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL);
@@ -199,6 +200,8 @@ class RadarStore:
             if "etag" not in columns: db.execute("ALTER TABLE sources ADD COLUMN etag TEXT")
             if "last_modified" not in columns: db.execute("ALTER TABLE sources ADD COLUMN last_modified TEXT")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
+            if "topic" not in columns: db.execute("ALTER TABLE sources ADD COLUMN topic TEXT")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)")
     def db(self):
         if self.path != ":memory:":
             fd=os.open(self.path,os.O_CREAT|os.O_RDWR,0o600);os.close(fd)
@@ -208,7 +211,7 @@ class RadarStore:
                 try:os.chmod(candidate,0o600)
                 except FileNotFoundError:pass
         db.row_factory=sqlite3.Row; return db
-    def add_source(self,name:str,kind:str,config:dict)->None:
+    def add_source(self,name:str,kind:str,config:dict,topic:str|None=None)->None:
         if not name.strip() or kind not in {"rss","github"}: raise ValueError("Source requires a name and kind rss|github")
         if kind=="rss":
             url=config.get("url","")
@@ -218,33 +221,48 @@ class RadarStore:
             if parts.username is not None or parts.password is not None:
                 raise ValueError("Do not put credentials in RSS URLs; use a public feed URL")
         if kind=="github" and not re.fullmatch(r"[^/]+/[^/]+",config.get("repo","")): raise ValueError("GitHub repository must use owner/repo")
-        config={**config,"name":name.strip()}
-        with self.db() as db: db.execute("INSERT INTO sources(name,kind,config) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,config=excluded.config,enabled=1",(name,kind,json.dumps(config)))
+        config={**config,"name":name.strip()}; topic=(topic or "").strip() or None
+        with self.db() as db: db.execute("INSERT INTO sources(name,kind,config,topic) VALUES(?,?,?,?) ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,config=excluded.config,topic=excluded.topic,enabled=1",(name.strip(),kind,json.dumps(config),topic))
     def sources(self):
         with self.db() as db: return list(db.execute("SELECT * FROM sources WHERE enabled=1 ORDER BY name"))
     def rules(self)->list[sqlite3.Row]:
         with self.db() as db:return list(db.execute("SELECT * FROM keyword_rules ORDER BY id"))
-    def add_rule(self,kind:str,keyword:str)->None:
+    def add_rule(self,kind:str,keyword:str,source:str|None=None,topic:str|None=None)->None:
         kind=kind.lower(); keyword=keyword.strip().casefold()
         if kind not in {"include","exclude"} or not keyword: raise ValueError("Rule must be include|exclude and non-empty")
-        with self.db() as db:db.execute("INSERT OR IGNORE INTO keyword_rules(kind,keyword) VALUES(?,?)",(kind,keyword))
-    def score(self,item:Item)->tuple[int,str]|None:
-        text=(item.title+" "+item.content).casefold(); rules=self.rules(); excludes=[r["keyword"] for r in rules if r["kind"]=="exclude"]
+        if source and topic: raise ValueError("Choose either a source or topic scope")
+        if not source and not topic:
+            with self.db() as db:db.execute("INSERT OR IGNORE INTO keyword_rules(kind,keyword) VALUES(?,?)",(kind,keyword))
+            return
+        scope_type="source" if source else "topic"; scope_value=(source or topic or "").strip()
+        if not scope_value: raise ValueError("Rule scope cannot be empty")
+        with self.db() as db:
+            if source and not db.execute("SELECT 1 FROM sources WHERE name=? AND enabled=1",(scope_value,)).fetchone(): raise ValueError("Scoped rule source not found")
+            db.execute("INSERT OR IGNORE INTO scoped_keyword_rules(kind,keyword,scope_type,scope_value) VALUES(?,?,?,?)",(kind,keyword,scope_type,scope_value))
+    def _rules_for(self,source_id:int|None,topic:str|None):
+        with self.db() as db:
+            rows=list(db.execute("SELECT kind,keyword,NULL scope_type,NULL scope_value FROM keyword_rules"))
+            if source_id is not None: rows.extend(db.execute("SELECT kind,keyword,scope_type,scope_value FROM scoped_keyword_rules WHERE scope_type='source' AND scope_value=(SELECT name FROM sources WHERE id=?)",(source_id,)))
+            if topic: rows.extend(db.execute("SELECT kind,keyword,scope_type,scope_value FROM scoped_keyword_rules WHERE scope_type='topic' AND scope_value=?",(topic,)))
+        return rows
+    def score(self,item:Item,source_id:int|None=None,topic:str|None=None)->tuple[int,str]|None:
+        text=(item.title+" "+item.content).casefold(); rules=self._rules_for(source_id,topic); excludes=[r["keyword"] for r in rules if r["kind"]=="exclude"]
         matched_ex=[w for w in excludes if w in text]
         if matched_ex:return None
         includes=[r["keyword"] for r in rules if r["kind"]=="include"]
         matched=[w for w in includes if w in text]
         if includes and not matched:return None
         reasons=[f"include keyword: {w}" for w in matched]
+        reasons.extend(f"{r['scope_type']} rule: {r['keyword']}" for r in rules if r["kind"]=="exclude" and r["keyword"] in text and r["scope_type"])
         score=min(100,10+25*len(matched))
         if item.published_at: reasons.append("publication date available")
         else: reasons.append("publication date unavailable")
         return score,"; ".join(reasons)
-    def upsert_items(self,source_id:int,items:list[Item])->tuple[int,int,int]:
+    def upsert_items(self,source_id:int,items:list[Item],topic:str|None=None)->tuple[int,int,int]:
         inserted=updated=ignored=0; now=utc_now()
         with self.db() as db:
             for item in items:
-                scored=self.score(item)
+                scored=self.score(item,source_id,topic)
                 if scored is None: ignored+=1; continue
                 canonical=item.canonical
                 old=db.execute("SELECT id,title,content_hash FROM normalized_items WHERE source_id=? AND canonical_url=?",(source_id,canonical)).fetchone()
@@ -264,7 +282,7 @@ class RadarStore:
             try:
                 adapter=RSSAdapter(http) if source["kind"]=="rss" else GitHubAdapter(http,token)
                 result=adapter.fetch(config,source["etag"],source["last_modified"])
-                added,updated,ignored=self.upsert_items(source["id"],result.items)
+                added,updated,ignored=self.upsert_items(source["id"],result.items,source["topic"])
                 with self.db() as db:db.execute("UPDATE sources SET last_fetched_at=?,last_checkpoint=?,etag=?,last_modified=?,last_error=NULL WHERE id=?",(utc_now(),result.etag or result.last_modified,result.etag,result.last_modified,source["id"]))
                 totals["inserted"]+=added; totals["updated"]+=updated; totals["ignored"]+=ignored
                 if result.not_modified: totals["not_modified"]+=1
@@ -286,6 +304,14 @@ class RadarStore:
         with self.db() as db:db.execute("UPDATE delivery_log SET state=?,delivered_at=?,error=? WHERE item_id=? AND state='sending'",("sent" if ok else "failed",utc_now() if ok else None,error[:300],item_id))
     def pending_delivery(self,limit:int=30):
         with self.db() as db:return list(db.execute("SELECT i.*,s.name source_name FROM normalized_items i JOIN sources s ON s.id=i.source_id LEFT JOIN delivery_log d ON d.item_id=i.id WHERE d.id IS NULL ORDER BY COALESCE(i.published_at,i.fetched_at) DESC LIMIT ?",(limit,)))
+    def recover_stale_deliveries(self,older_than_seconds:int=600,now:datetime|None=None)->int:
+        """Mark interrupted Telegram sends uncertain; never resend automatically."""
+        if older_than_seconds<1: raise ValueError("Recovery age must be positive")
+        cutoff=(now or datetime.now(UTC)).astimezone(UTC).timestamp()-older_than_seconds
+        cutoff_iso=datetime.fromtimestamp(cutoff,UTC).isoformat()
+        with self.db() as db:
+            cur=db.execute("UPDATE delivery_log SET state='unknown',error='Delivery outcome uncertain after interrupted send' WHERE state='sending' AND created_at<?",(cutoff_iso,))
+            return cur.rowcount
     def delivery_allowed(self)->bool:
         with self.db() as db:
             row=db.execute("SELECT value FROM metadata WHERE key='min_interval_seconds'").fetchone()

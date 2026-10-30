@@ -24,6 +24,7 @@ def render_digest(rows)->str:
 async def send_digest(store:RadarStore,token:str,chat_id:str)->str:
     from aiogram import Bot
     from aiogram.exceptions import TelegramRetryAfter
+    store.recover_stale_deliveries()
     rows=store.pending_delivery()
     if not rows:return "Новых сигналов нет."
     if not store.delivery_allowed():return "Пауза между отправками ещё не прошла; сообщения не отправлены."
@@ -74,8 +75,8 @@ def scheduled_key(now,timezone_name:str,cadence:str,send_hour:int,quiet_start:in
 def main()->None:
     load_dotenv(); p=argparse.ArgumentParser(prog="signal-radar");p.add_argument("--db",default=os.getenv("DATABASE_PATH","signal_radar.sqlite3"))
     sub=p.add_subparsers(dest="command",required=True)
-    add=sub.add_parser("add-source");add.add_argument("kind",choices=["rss","github"]);add.add_argument("name");add.add_argument("value",help="RSS URL or GitHub owner/repo")
-    rule=sub.add_parser("rule");rule.add_argument("kind",choices=["include","exclude"]);rule.add_argument("keyword")
+    add=sub.add_parser("add-source");add.add_argument("kind",choices=["rss","github"]);add.add_argument("name");add.add_argument("value",help="RSS URL or GitHub owner/repo");add.add_argument("--topic",help="optional rule-matching topic")
+    rule=sub.add_parser("rule");rule.add_argument("kind",choices=["include","exclude"]);rule.add_argument("keyword");scope=rule.add_mutually_exclusive_group();scope.add_argument("--source",help="scope to a configured source name");scope.add_argument("--topic",help="scope to a source topic")
     sub.add_parser("collect")
     items=sub.add_parser("items");items.add_argument("--limit",type=int,default=20)
     why=sub.add_parser("why");why.add_argument("item_id",type=int)
@@ -85,8 +86,8 @@ def main()->None:
     args=p.parse_args();store=RadarStore(args.db)
     if args.command=="add-source":
         config={"url":args.value} if args.kind=="rss" else {"repo":args.value}
-        store.add_source(args.name,args.kind,config);print(f"Source configured: {args.name} ({args.kind})")
-    elif args.command=="rule":store.add_rule(args.kind,args.keyword);print("Rule saved.")
+        store.add_source(args.name,args.kind,config,args.topic);print(f"Source configured: {args.name} ({args.kind})")
+    elif args.command=="rule":store.add_rule(args.kind,args.keyword,args.source,args.topic);print("Rule saved.")
     elif args.command in {"collect","run"}:
         if args.command=="collect":print(json.dumps(store.collect(HttpClient(),os.getenv("GITHUB_TOKEN")),ensure_ascii=False,indent=2))
         else:

@@ -110,8 +110,39 @@ def test_rss_validator_columns_migrate_existing_database(tmp_path):
     store=RadarStore(str(path))
     with store.db() as db:
         columns={row[1] for row in db.execute("PRAGMA table_info(sources)")}
-        assert {"etag","last_modified"}.issubset(columns)
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]==2
+        assert {"etag","last_modified","topic"}.issubset(columns)
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]==3
+
+
+def test_scoped_source_and_topic_rules_only_apply_to_matching_items(tmp_path):
+    store=RadarStore(str(tmp_path/"scoped.db"))
+    store.add_source("vendor","rss",{"url":"https://vendor.test/rss"},topic="releases")
+    store.add_source("other","rss",{"url":"https://other.test/rss"},topic="news")
+    sources={row["name"]:row for row in store.sources()};vendor=sources["vendor"];other=sources["other"]
+    store.add_rule("include","release",source="vendor")
+    store.add_rule("exclude","preview",topic="releases")
+    item=Item("https://item.test/a","Release candidate","feed",None,"details")
+    assert store.upsert_items(vendor["id"],[item],vendor["topic"])==(1,0,0)
+    assert store.upsert_items(other["id"],[item],other["topic"])==(1,0,0)
+    excluded=Item("https://item.test/b","Release preview","feed",None)
+    assert store.upsert_items(vendor["id"],[excluded],vendor["topic"])==(0,0,1)
+    assert store.upsert_items(other["id"],[excluded],other["topic"])==(1,0,0)
+
+
+def test_stale_delivery_is_marked_uncertain_and_never_requeued(tmp_path):
+    from datetime import datetime, timedelta
+
+    store=RadarStore(str(tmp_path/"delivery.db"));store.add_source("x","rss",{"url":"https://x.test"})
+    source=store.sources()[0];store.upsert_items(source["id"],[Item("https://x.test/a","A","x",None)])
+    row=store.pending_delivery()[0];assert store.reserve_delivery(row["id"])
+    started=datetime.now(UTC)-timedelta(hours=1)
+    with store.db() as db:db.execute("UPDATE delivery_log SET created_at=? WHERE item_id=?",(started.isoformat(),row["id"]))
+    assert store.recover_stale_deliveries(now=datetime.now(UTC))==1
+    assert store.recover_stale_deliveries(now=datetime.now(UTC))==0
+    assert store.pending_delivery()==[]
+    with store.db() as db:
+        delivery=db.execute("SELECT state,error FROM delivery_log WHERE item_id=?",(row["id"],)).fetchone()
+    assert delivery["state"]=="unknown" and "uncertain" in delivery["error"]
 
 
 def test_database_file_is_private_by_default(tmp_path):
