@@ -328,13 +328,45 @@ class RadarStore:
         with self.db() as db:
             cur=db.execute("UPDATE delivery_log SET state='unknown',error='Delivery outcome uncertain after interrupted send' WHERE state='sending' AND created_at<?",(cutoff_iso,))
             return cur.rowcount
-    def delivery_allowed(self)->bool:
-        with self.db() as db:
-            row=db.execute("SELECT value FROM metadata WHERE key='min_interval_seconds'").fetchone()
-            last=db.execute("SELECT created_at FROM delivery_log ORDER BY id DESC LIMIT 1").fetchone()
+    @staticmethod
+    def _delivery_window_open(db:sqlite3.Connection,now:datetime)->bool:
+        row=db.execute("SELECT value FROM metadata WHERE key='min_interval_seconds'").fetchone()
         interval=int(row[0]) if row else 0
-        if interval==0 or not last:return True
-        then=datetime.fromisoformat(last[0]); return (datetime.now(UTC)-then).total_seconds()>=interval
+        if interval==0:return True
+        markers=[]
+        reservation=db.execute("SELECT value FROM metadata WHERE key='last_digest_window_at'").fetchone()
+        if reservation:
+            markers.append(datetime.fromisoformat(reservation[0]))
+        last_delivery=db.execute("SELECT created_at FROM delivery_log ORDER BY id DESC LIMIT 1").fetchone()
+        if last_delivery:
+            markers.append(datetime.fromisoformat(last_delivery[0]))
+        if not markers:return True
+        then=max(markers)
+        if then.tzinfo is None:then=then.replace(tzinfo=UTC)
+        return (now.astimezone(UTC)-then.astimezone(UTC)).total_seconds()>=interval
+
+    def delivery_allowed(self,now:datetime|None=None)->bool:
+        """Read the persisted cooldown state; claim_digest_window also serializes the check."""
+        clock=now or datetime.now(UTC)
+        if clock.tzinfo is None:raise ValueError("Delivery clock must be timezone-aware")
+        with self.db() as db:return self._delivery_window_open(db,clock)
+
+    def claim_digest_window(self,now:datetime|None=None)->bool:
+        """Atomically reserve the global notification interval across concurrent processes.
+
+        The reservation is persisted before network delivery. A process crash or uncertain send
+        therefore consumes the cooldown conservatively instead of allowing a parallel duplicate.
+        """
+        clock=now or datetime.now(UTC)
+        if clock.tzinfo is None:raise ValueError("Delivery clock must be timezone-aware")
+        timestamp=clock.astimezone(UTC).isoformat()
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not self._delivery_window_open(db,clock):return False
+            interval_row=db.execute("SELECT value FROM metadata WHERE key='min_interval_seconds'").fetchone()
+            if interval_row and int(interval_row[0])>0:
+                db.execute("INSERT INTO metadata(key,value) VALUES('last_digest_window_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(timestamp,))
+            return True
     def digest_marked(self,key:str)->bool:
         with self.db() as db:return db.execute("SELECT 1 FROM metadata WHERE key=?",(key,)).fetchone() is not None
     def mark_digest(self,key:str)->None:

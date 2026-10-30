@@ -44,7 +44,7 @@ async def send_digest(store:RadarStore,token:str,chat_id:str,intro:str="")->str:
     store.recover_stale_deliveries()
     rows=store.pending_delivery()
     if not rows:return "Новых сигналов нет."
-    if not store.delivery_allowed():return "Пауза между отправками ещё не прошла; сообщения не отправлены."
+    if not store.claim_digest_window():return "Пауза между отправками ещё не прошла; сообщения не отправлены."
     bot=Bot(token)
     sent=0; intro_pending=intro.strip(); batch_text=intro_pending; batch_claims=[]; batch_count=0
 

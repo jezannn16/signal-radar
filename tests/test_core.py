@@ -4,6 +4,8 @@ import sqlite3
 from datetime import UTC, datetime
 from stat import S_IMODE
 
+import pytest
+
 from signal_radar.core import HttpClient, HttpResult, Item, RadarStore, canonical_url, parse_feed
 
 
@@ -42,6 +44,70 @@ def test_delivery_claim_and_rate_limit(tmp_path):
     row=store.pending_delivery()[0];assert store.reserve_delivery(row["id"]);assert not store.reserve_delivery(row["id"])
     store.finish_delivery(row["id"],True);assert store.pending_delivery()==[]
     store.set_min_interval(3600);assert not store.delivery_allowed()
+
+
+def test_minimum_digest_interval_is_atomically_claimed_and_persists_across_restart(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timedelta
+    from threading import Barrier
+
+    path=tmp_path/"interval.db"
+    store=RadarStore(str(path));store.set_min_interval(60)
+    clock=datetime(2026,10,30,12,tzinfo=UTC)
+    barrier=Barrier(2)
+
+    def claim():
+        independent_store=RadarStore(str(path))
+        barrier.wait()
+        return independent_store.claim_digest_window(clock)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        outcomes=list(workers.map(lambda _:claim(),range(2)))
+    assert sorted(outcomes)==[False,True]
+    restarted=RadarStore(str(path))
+    assert not restarted.delivery_allowed(clock+timedelta(seconds=59))
+    assert restarted.claim_digest_window(clock+timedelta(seconds=59)) is False
+    assert restarted.claim_digest_window(clock+timedelta(seconds=60)) is True
+
+
+def test_minimum_interval_rejects_naive_clock(tmp_path):
+    from datetime import datetime
+
+    store=RadarStore(str(tmp_path/"interval-clock.db"))
+    with pytest.raises(ValueError,match="timezone-aware"):
+        store.claim_digest_window(datetime(2026,10,30,12))
+
+
+def test_minimum_interval_is_local_to_database_and_blocks_cli_digest_without_sending(tmp_path):
+    import sys
+    from datetime import datetime
+    from types import ModuleType
+    from unittest.mock import patch
+
+    from signal_radar.cli import send_digest
+
+    path=tmp_path/"throttled.db"
+    store=RadarStore(str(path));store.set_min_interval(3600)
+    store.add_source("synthetic","rss",{"url":"https://feed.example.test/rss"})
+    source=store.sources()[0]
+    store.upsert_items(source["id"],[Item("https://item.example.test/1","Synthetic release","test",None)])
+    now=datetime.now(UTC)
+    assert store.claim_digest_window(now)
+    assert not RadarStore(str(path)).delivery_allowed(now)
+    assert RadarStore(str(tmp_path/"isolated.db")).delivery_allowed(now)
+
+    class UnexpectedBot:
+        def __init__(self,_token):
+            raise AssertionError("cooldown must stop before constructing a Telegram client")
+
+    aiogram=ModuleType("aiogram");aiogram.Bot=UnexpectedBot
+    exceptions=ModuleType("aiogram.exceptions")
+    class RetryAfter(Exception):pass
+    exceptions.TelegramRetryAfter=RetryAfter
+    with patch.dict(sys.modules,{"aiogram":aiogram,"aiogram.exceptions":exceptions}):
+        result=asyncio.run(send_digest(store,"synthetic-token","synthetic-chat"))
+    assert result=="Пауза между отправками ещё не прошла; сообщения не отправлены."
+    assert len(store.pending_delivery())==1
 
 
 def test_github_adapter_paginates_with_link_header():
